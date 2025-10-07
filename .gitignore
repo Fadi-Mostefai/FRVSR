@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+
+# Dataset
+data/
+
+# Checkpoints and generated outputs
+checkpoints/
+output_frames/
+output_sr.mp4
+
+# Python cache
+__pycache__/
+*.pyc
