@@ -7,6 +7,7 @@ from math import log10
 from tqdm import tqdm
 from dataloader import FRVSRDataset
 from FRVSR import FRVSR, warp
+from torch.amp import autocast, GradScaler  # Add this
 
 # PSNR Calculation
 def calc_psnr(sr, hr):
@@ -29,24 +30,29 @@ def compute_losses(est_hr, gt_hr, prev_lr, curr_lr, flow_lr):
 def train_frvsr(
     save_dir="checkpoints",
     num_epochs=50,
-    batch_size=2,
+    batch_size=8,
     learning_rate=1e-4,
     scale=4,
     fnet_variant="C",
-    device="cuda" if torch.cuda.is_available() else "cpu"
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    gradient_accumulation_steps=6  # Accumulate gradients across temporal frames
 ):
     os.makedirs(save_dir, exist_ok=True)
 
-    # Dataset & loader
-    # dataloader.FRVSRDataset expects (root_dir, list_path, scale=4, transform=None)
-    # The project includes `data/sep_trainlist.txt` and a `data/sequences/` folder, so pass those.
     list_path = os.path.join("data", "sep_trainlist.txt")
     train_set = FRVSRDataset(root_dir="data", list_path=list_path, scale=scale)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=4, persistent_workers=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
-    # Model
     model = FRVSR(scale=scale, fnet_variant=fnet_variant).to(device)
+    
+    # torch.compile is disabled due to Triton incompatibility on Windows
+    # if hasattr(torch, 'compile'):
+    #     model = torch.compile(model, mode='max-autotune')
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Add gradient scaler for mixed precision
+    scaler = GradScaler('cuda')
 
     best_psnr = 0.0
 
@@ -56,45 +62,50 @@ def train_frvsr(
         epoch_loss = 0.0
         epoch_psnr = 0.0
 
-        for lr_seq, hr_seq in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            lr_seq = lr_seq.to(device)  # [B, T, 3, H, W]
-            hr_seq = hr_seq.to(device)  # [B, T, 3, sH, sW]
+        for batch_idx, (lr_seq, hr_seq) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            lr_seq = lr_seq.to(device, non_blocking=True)
+            hr_seq = hr_seq.to(device, non_blocking=True)
 
             B, T, C, H, W = lr_seq.size()
             prev_est_hr = torch.zeros(B, C, H * scale, W * scale, device=device)
 
-            batch_loss = 0
+            # Accumulate loss across all temporal frames before backward
+            total_loss = 0
             psnr_sum = 0
 
             for t in range(1, T):
                 prev_lr, curr_lr = lr_seq[:, t - 1], lr_seq[:, t]
                 gt_hr = hr_seq[:, t]
 
-                # Shape checks
-                assert prev_lr.shape == curr_lr.shape == (B, C, H, W)
-                assert gt_hr.shape == (B, C, H * scale, W * scale)
+                # Use autocast for mixed precision
+                with autocast('cuda'):
+                    est_hr, flow_lr = model(prev_lr, curr_lr, prev_est_hr)
+                    loss, _, _ = compute_losses(est_hr, gt_hr, prev_lr, curr_lr, flow_lr)
+                
+                # Accumulate loss (normalize by number of frames)
+                total_loss += loss / (T - 1)
+                
+                with torch.no_grad():
+                    psnr_sum += calc_psnr(est_hr, gt_hr)
+                    prev_est_hr = est_hr.detach()
 
-                est_hr, flow_lr = model(prev_lr, curr_lr, prev_est_hr)
-                loss, _, _ = compute_losses(est_hr, gt_hr, prev_lr, curr_lr, flow_lr)
+            # Single backward pass for entire sequence
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                batch_loss += loss.item()
-                psnr_sum += calc_psnr(est_hr, gt_hr)
-                prev_est_hr = est_hr.detach()  # carry forward
-
-            epoch_loss += batch_loss / (T - 1)
+            epoch_loss += total_loss.item()
             epoch_psnr += psnr_sum / (T - 1)
 
         avg_loss = epoch_loss / len(train_loader)
         avg_psnr = epoch_psnr / len(train_loader)
         print(f"Epoch [{epoch+1}/{num_epochs}] | Loss: {avg_loss:.5f} | PSNR: {avg_psnr:.2f} dB")
 
-        # Save checkpoint
-        checkpoint_path = os.path.join(save_dir, f"frvsr_epoch_{epoch+1}.pth")
-        torch.save(model.state_dict(), checkpoint_path)
+        # Save checkpoint every 5 epochs instead of every epoch
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = os.path.join(save_dir, f"frvsr_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
 
         # Optionally save a sample output
         if epoch == num_epochs - 1:
@@ -109,4 +120,28 @@ def train_frvsr(
 
 # Run training
 if __name__ == "__main__":
+    # Enable cudnn benchmarking for faster convolutions
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Check CUDA version and GPU
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
+    print(f"cuDNN version: {torch.backends.cudnn.version()}")
+    print(f"Tensor Cores (TF32) enabled: {torch.backends.cuda.matmul.allow_tf32}")
+    print()
+    
+    train_frvsr(batch_size=16)  # Increase batch size
+
+    # Enable cudnn benchmarking
+    torch.backends.cudnn.benchmark = True
+
+    # Add this to monitor GPU usage
+    print(f"GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    print(f"GPU Memory Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
     train_frvsr()

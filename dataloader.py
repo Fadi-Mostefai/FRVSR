@@ -29,33 +29,27 @@ class FRVSRDataset(Dataset):
         seq_path = self.sequences[idx]
         full_path = os.path.join(self.root_dir, "sequences", seq_path)
 
-        # Load all 7 frames
-        frames = []
+        # Pre-allocate arrays for better performance
+        frames = np.empty((7, 256, 448, 3), dtype=np.float32)  # Adjust size if needed
+        
         for i in range(1, 8):
             img_path = os.path.join(full_path, f"im{i}.png")
-            img = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
-            frames.append(img)
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            frames[i-1] = img.astype(np.float32) / 255.0
 
-        # Convert to numpy array of shape (7, H, W, 3)
-        frames = np.stack(frames, axis=0)
+        # More efficient downsampling
+        H, W = frames.shape[1:3]
+        lr_frames = np.empty((7, H // self.scale, W // self.scale, 3), dtype=np.float32)
+        
+        for i in range(7):
+            lr_frames[i] = cv2.resize(frames[i], 
+                                     (W // self.scale, H // self.scale), 
+                                     interpolation=cv2.INTER_CUBIC)
 
-        # Generate LR frames (downsampled)
-        lr_frames = np.array([cv2.resize(f, 
-                                         (f.shape[1] // self.scale, f.shape[0] // self.scale), 
-                                         interpolation=cv2.INTER_CUBIC)
-                              for f in frames])
-
-        # Apply transforms
-        if self.transform:
-            frames = torch.stack([self.transform(Image.fromarray((f * 255).astype(np.uint8))) for f in frames])
-            lr_frames = torch.stack([self.transform(Image.fromarray((lf * 255).astype(np.uint8))) for lf in lr_frames])
-        else:
-            frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
-            lr_frames = torch.from_numpy(lr_frames).permute(0, 3, 1, 2)
-
-        # Shape checks
-        assert lr_frames.shape[1:] == (3, frames.shape[2] // self.scale, frames.shape[3] // self.scale), "LR shape mismatch"
-        assert frames.shape[1:] == (3, frames.shape[2], frames.shape[3]), "HR shape mismatch"
+        # Direct torch conversion (faster than Image transforms)
+        frames = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous()
+        lr_frames = torch.from_numpy(lr_frames).permute(0, 3, 1, 2).contiguous()
 
         return lr_frames, frames  # (LR_seq, HR_seq)
 
