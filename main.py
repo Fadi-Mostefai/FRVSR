@@ -5,9 +5,9 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from math import log10
 from tqdm import tqdm
-from dataloader import FRVSRDataset
+from dataloader import FRVSRDatasetFast  # Use fast dataloader
 from FRVSR import FRVSR, warp
-from torch.amp import autocast, GradScaler  # Add this
+from torch.amp import autocast, GradScaler
 
 # PSNR Calculation
 def calc_psnr(sr, hr):
@@ -30,28 +30,24 @@ def compute_losses(est_hr, gt_hr, prev_lr, curr_lr, flow_lr):
 def train_frvsr(
     save_dir="checkpoints",
     num_epochs=50,
-    batch_size=8,
+    batch_size=16,
     learning_rate=1e-4,
     scale=4,
     fnet_variant="C",
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    gradient_accumulation_steps=6  # Accumulate gradients across temporal frames
+    device="cuda" if torch.cuda.is_available() else "cpu"
 ):
     os.makedirs(save_dir, exist_ok=True)
 
     list_path = os.path.join("data", "sep_trainlist.txt")
-    train_set = FRVSRDataset(root_dir="data", list_path=list_path, scale=scale)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+    
+    # Use fast dataloader with pre-processed LR images
+    train_set = FRVSRDatasetFast(root_dir="data", list_path=list_path, scale=scale)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, 
+                             num_workers=8, pin_memory=True, prefetch_factor=2, 
+                             persistent_workers=True)
 
     model = FRVSR(scale=scale, fnet_variant=fnet_variant).to(device)
-    
-    # torch.compile is disabled due to Triton incompatibility on Windows
-    # if hasattr(torch, 'compile'):
-    #     model = torch.compile(model, mode='max-autotune')
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Add gradient scaler for mixed precision
     scaler = GradScaler('cuda')
 
     best_psnr = 0.0
@@ -128,20 +124,7 @@ if __name__ == "__main__":
     # Check CUDA version and GPU
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA version: {torch.version.cuda}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
-    print(f"cuDNN version: {torch.backends.cudnn.version()}")
-    print(f"Tensor Cores (TF32) enabled: {torch.backends.cuda.matmul.allow_tf32}")
     print()
     
     train_frvsr(batch_size=16)  # Increase batch size
-
-    # Enable cudnn benchmarking
-    torch.backends.cudnn.benchmark = True
-
-    # Add this to monitor GPU usage
-    print(f"GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    print(f"GPU Memory Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-
-    train_frvsr()
